@@ -1,0 +1,42 @@
+# 基础试验配置
+random_seed: 42
+task_type: instance # 'semantic' or 'instance'
+
+model:
+  # Semantic Segmentation
+  backbone: efficientnet_b3
+  num_classes: 2
+  pretrained: true
+  output_stride: 16
+  use_cbam: true
+  
+  # Instance Segmentation (Mask R-CNN)
+  maskrcnn:
+    backbone: resnet50_fpn_v2 # 目前支持 resnet50_fpn_v2
+    trainable_backbone_layers: 3 # 0-5, 3 means top 3 blocks are trainable
+    min_size: 512
+    max_size: 800
+    pretrained: true
+
+loss:
+  use_ohem: false
+  use_focal: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  ignore_index: 255
+  ohem_thresh: 0.7
+  ohem_min_kept: 100000
+
+train:
+  batch_size: 16
+  epochs: 100
+  lr: 0.001
+  weight_decay: 0.0001
+  img_size: 512
+
+data:
+  root_dir: /root/autodl-fs/rice_disease_detect/data
+  train_list: train.txt
+  val_list: val.txt
+  val_split: 0.2 # 验证集比例
