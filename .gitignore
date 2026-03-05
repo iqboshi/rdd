@@ -1,0 +1,17 @@
+# Data
+data/
+runs/
+predictions/
+predictions_instance/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.idea/
+.vscode/
+
+# System
+.DS_Store
