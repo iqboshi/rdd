@@ -1,17 +1,37 @@
-# Data
-data/
-runs/
-predictions/
-predictions_instance/
-
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
 
-# IDE
-.idea/
-.vscode/
+# Virtual envs
+.venv/
+venv/
+rdd-dev/
 
-# System
+# Local temp/cache
+.tmp/
+*.log
+
+# Data and experiment artifacts
+data/
+outputs/
+visual/
+pretrain_riceseg/outputs/
+
+# Model weights / checkpoints
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+
+# Numpy data artifacts
+*.npy
+*.npz
+
+# OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
