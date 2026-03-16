@@ -46,6 +46,12 @@ try {
             (Join-Path $sourceRoot "rdd-dev"),
             (Join-Path $sourceRoot "pretrain_riceseg\outputs")
         )
+        $tempRepoDirs = Get-ChildItem -Path $sourceRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "rdd_repo*_tmp" } |
+            Select-Object -ExpandProperty FullName
+        if ($tempRepoDirs) {
+            $excludeDirs += $tempRepoDirs
+        }
         $excludeFiles = @("*.pth", "*.pt", "*.ckpt", "*.onnx", "*.bin", "*.safetensors", "*.npy", "*.npz", "*.pyc")
 
         $robocopyArgs = @(
