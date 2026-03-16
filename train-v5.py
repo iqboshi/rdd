@@ -67,6 +67,11 @@ def parse_args():
     parser.add_argument("--w_cls", type=float, default=0.5, help="Weight for classification loss.")
     parser.add_argument("--w_mask", type=float, default=2.0, help="Weight for mask BCE loss.")
     parser.add_argument("--w_dice", type=float, default=2.0, help="Weight for dice loss.")
+    parser.add_argument("--enable_aux_heads", action="store_true", help="Enable center+offset auxiliary heads (A-v1).")
+    parser.add_argument("--w_center", type=float, default=0.30, help="Weight for center heatmap BCE aux loss.")
+    parser.add_argument("--w_offset", type=float, default=0.05, help="Weight for offset L1 aux loss.")
+    parser.add_argument("--center_sigma", type=float, default=4.0, help="Sigma for center heatmap targets.")
+    parser.add_argument("--offset_clip", type=float, default=64.0, help="Clip absolute target offset values.")
     parser.add_argument("--match_cls", type=float, default=1.0)
     parser.add_argument("--match_mask", type=float, default=1.0)
     parser.add_argument("--match_dice", type=float, default=1.0)
@@ -261,6 +266,68 @@ def prepare_targets(batch: Dict, device: torch.device):
     return targets
 
 
+def build_center_offset_targets_for_batch(
+    instance_maps: torch.Tensor,
+    device: torch.device,
+    center_sigma: float = 4.0,
+    offset_clip: float = 64.0,
+) -> Dict[str, torch.Tensor]:
+    inst = instance_maps.to(device, non_blocking=True).long()
+    bsz, h, w = inst.shape
+    center_targets = torch.zeros((bsz, h, w), dtype=torch.float32, device=device)
+    offset_targets = torch.zeros((bsz, 2, h, w), dtype=torch.float32, device=device)
+    fg_mask = (inst > 0).float()
+
+    sigma = float(center_sigma)
+    radius = max(1, int(round(3.0 * sigma))) if sigma > 0 else 0
+
+    for b in range(bsz):
+        ids = torch.unique(inst[b])
+        ids = ids[ids > 0]
+        for ins_id in ids.tolist():
+            ys, xs = torch.where(inst[b] == int(ins_id))
+            if ys.numel() == 0:
+                continue
+
+            ys_f = ys.float()
+            xs_f = xs.float()
+            cy = ys_f.mean()
+            cx = xs_f.mean()
+
+            offset_targets[b, 0, ys, xs] = cy - ys_f
+            offset_targets[b, 1, ys, xs] = cx - xs_f
+
+            if sigma <= 0:
+                x = int(round(float(cx)))
+                y = int(round(float(cy)))
+                if 0 <= x < w and 0 <= y < h:
+                    center_targets[b, y, x] = torch.maximum(
+                        center_targets[b, y, x], torch.tensor(1.0, device=device)
+                    )
+                continue
+
+            x0 = max(0, int(torch.floor(cx).item()) - radius)
+            y0 = max(0, int(torch.floor(cy).item()) - radius)
+            x1 = min(w, int(torch.floor(cx).item()) + radius + 1)
+            y1 = min(h, int(torch.floor(cy).item()) + radius + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+
+            grid_x = torch.arange(x0, x1, device=device, dtype=torch.float32)[None, :]
+            grid_y = torch.arange(y0, y1, device=device, dtype=torch.float32)[:, None]
+            g = torch.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2.0 * sigma * sigma))
+            center_targets[b, y0:y1, x0:x1] = torch.maximum(center_targets[b, y0:y1, x0:x1], g)
+
+    if offset_clip > 0:
+        offset_targets = torch.clamp(offset_targets, min=-float(offset_clip), max=float(offset_clip))
+
+    return {
+        "center": center_targets,
+        "offset": offset_targets,
+        "fg_mask": fg_mask,
+    }
+
+
 def tensor_image_to_rgb_uint8(image_tensor: torch.Tensor) -> np.ndarray:
     img = image_tensor.detach().cpu().float().numpy()
     if img.ndim == 3 and img.shape[0] in (1, 3, 4):
@@ -360,10 +427,14 @@ def init_csv_logger(csv_path: Path):
                     "train_cls",
                     "train_mask",
                     "train_dice",
+                    "train_center",
+                    "train_offset",
                     "val_total",
                     "val_cls",
                     "val_mask",
                     "val_dice",
+                    "val_center",
+                    "val_offset",
                     "lr",
                 ]
             )
@@ -478,6 +549,8 @@ def run_one_epoch(
     total_cls = 0.0
     total_mask = 0.0
     total_dice = 0.0
+    total_center = 0.0
+    total_offset = 0.0
     steps = 0
     vis_saved = False
     autocast_enabled = bool(args.amp and device.type == "cuda")
@@ -518,6 +591,30 @@ def run_one_epoch(
                     w_dice=args.w_dice,
                 )
                 loss = loss_dict["loss"]
+                loss_center = torch.tensor(0.0, device=device)
+                loss_offset = torch.tensor(0.0, device=device)
+
+                if bool(args.enable_aux_heads):
+                    if "pred_center" not in outputs or "pred_offset" not in outputs:
+                        raise RuntimeError("Aux heads enabled but model outputs missing pred_center/pred_offset.")
+                    aux_targets = build_center_offset_targets_for_batch(
+                        instance_maps=batch["instance_map"],
+                        device=device,
+                        center_sigma=args.center_sigma,
+                        offset_clip=args.offset_clip,
+                    )
+                    pred_center = outputs["pred_center"].squeeze(1)
+                    loss_center = F.binary_cross_entropy_with_logits(pred_center, aux_targets["center"])
+
+                    fg = aux_targets["fg_mask"].unsqueeze(1)
+                    offset_l1 = torch.abs(outputs["pred_offset"] - aux_targets["offset"])
+                    denom = fg.sum().clamp(min=1.0)
+                    loss_offset = (offset_l1 * fg).sum() / denom
+                    loss = loss + float(args.w_center) * loss_center + float(args.w_offset) * loss_offset
+
+                loss_dict["loss_center"] = loss_center
+                loss_dict["loss_offset"] = loss_offset
+                loss_dict["loss"] = loss
 
             if train_mode:
                 optimizer.zero_grad(set_to_none=True)
@@ -533,6 +630,8 @@ def run_one_epoch(
         total_cls += float(loss_dict["loss_cls"].detach().cpu().item())
         total_mask += float(loss_dict["loss_mask"].detach().cpu().item())
         total_dice += float(loss_dict["loss_dice"].detach().cpu().item())
+        total_center += float(loss_dict["loss_center"].detach().cpu().item())
+        total_offset += float(loss_dict["loss_offset"].detach().cpu().item())
         steps += 1
 
         progress.set_postfix(
@@ -540,6 +639,8 @@ def run_one_epoch(
             cls=f"{loss_dict['loss_cls'].detach().cpu().item():.4f}",
             mask=f"{loss_dict['loss_mask'].detach().cpu().item():.4f}",
             dice=f"{loss_dict['loss_dice'].detach().cpu().item():.4f}",
+            ctr=f"{loss_dict['loss_center'].detach().cpu().item():.4f}",
+            off=f"{loss_dict['loss_offset'].detach().cpu().item():.4f}",
         )
 
         if (not vis_saved) and (args.vis_every > 0) and (epoch % args.vis_every == 0):
@@ -560,6 +661,8 @@ def run_one_epoch(
             "loss_cls": 0.0,
             "loss_mask": 0.0,
             "loss_dice": 0.0,
+            "loss_center": 0.0,
+            "loss_offset": 0.0,
             "steps": 0,
         }
 
@@ -568,6 +671,8 @@ def run_one_epoch(
         "loss_cls": total_cls / steps,
         "loss_mask": total_mask / steps,
         "loss_dice": total_dice / steps,
+        "loss_center": total_center / steps,
+        "loss_offset": total_offset / steps,
         "steps": steps,
     }
 
@@ -599,6 +704,11 @@ def main():
     print(f"[INFO] Roots: {args.roots}")
     print(f"[INFO] Experiment dir: {save_dir}")
     print(f"[INFO] Loss weights: w_cls={args.w_cls}, w_mask={args.w_mask}, w_dice={args.w_dice}")
+    print(
+        f"[INFO] Aux heads: enable={bool(args.enable_aux_heads)}, "
+        f"w_center={args.w_center}, w_offset={args.w_offset}, "
+        f"center_sigma={args.center_sigma}, offset_clip={args.offset_clip}"
+    )
 
     train_transform = get_train_transform(target_size=args.input_size)
     val_transform = get_val_transform(target_size=args.input_size)
@@ -645,6 +755,7 @@ def main():
         pretrained=args.pretrained,
         input_size=args.input_size,
         upsample_masks_to_input=True,
+        enable_aux_heads=bool(args.enable_aux_heads),
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -679,14 +790,17 @@ def main():
         resume_path = Path(args.resume)
         if resume_path.is_file():
             ckpt = torch.load(str(resume_path), map_location=device)
-            model.load_state_dict(ckpt["model"], strict=True)
+            missing, unexpected = model.load_state_dict(ckpt["model"], strict=not bool(args.enable_aux_heads))
             optimizer.load_state_dict(ckpt["optimizer"])
             scheduler.load_state_dict(ckpt["scheduler"])
             if "scaler" in ckpt and ckpt["scaler"] is not None:
                 scaler.load_state_dict(ckpt["scaler"])
             start_epoch = int(ckpt.get("epoch", 0)) + 1
             best_val = float(ckpt.get("best_val", best_val))
-            print(f"[INFO] Resumed from {resume_path}, start_epoch={start_epoch}, best_val={best_val:.6f}")
+            print(
+                f"[INFO] Resumed from {resume_path}, start_epoch={start_epoch}, best_val={best_val:.6f}, "
+                f"missing={len(missing)}, unexpected={len(unexpected)}"
+            )
         else:
             print(f"[WARN] Resume checkpoint not found: {resume_path}")
 
@@ -724,9 +838,11 @@ def main():
         msg = (
             f"[Epoch {epoch:03d}/{args.epochs:03d}] "
             f"train_total={train_stats['loss']:.4f} "
-            f"(cls={train_stats['loss_cls']:.4f}, mask={train_stats['loss_mask']:.4f}, dice={train_stats['loss_dice']:.4f}) | "
+            f"(cls={train_stats['loss_cls']:.4f}, mask={train_stats['loss_mask']:.4f}, dice={train_stats['loss_dice']:.4f}, "
+            f"center={train_stats['loss_center']:.4f}, offset={train_stats['loss_offset']:.4f}) | "
             f"val_total={val_stats['loss']:.4f} "
-            f"(cls={val_stats['loss_cls']:.4f}, mask={val_stats['loss_mask']:.4f}, dice={val_stats['loss_dice']:.4f}) | "
+            f"(cls={val_stats['loss_cls']:.4f}, mask={val_stats['loss_mask']:.4f}, dice={val_stats['loss_dice']:.4f}, "
+            f"center={val_stats['loss_center']:.4f}, offset={val_stats['loss_offset']:.4f}) | "
             f"lr={lr_now:.6e} | time={elapsed:.1f}s"
         )
         print(msg)
@@ -739,10 +855,14 @@ def main():
                 train_stats["loss_cls"],
                 train_stats["loss_mask"],
                 train_stats["loss_dice"],
+                train_stats["loss_center"],
+                train_stats["loss_offset"],
                 val_stats["loss"],
                 val_stats["loss_cls"],
                 val_stats["loss_mask"],
                 val_stats["loss_dice"],
+                val_stats["loss_center"],
+                val_stats["loss_offset"],
                 lr_now,
             ],
         )

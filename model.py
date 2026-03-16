@@ -146,6 +146,30 @@ class QueryMaskHead(nn.Module):
         return {"pred_logits": pred_logits, "pred_masks": pred_masks}
 
 
+class AuxiliaryGeometryHead(nn.Module):
+    """Predict center heatmap and offset field from shared mask feature."""
+
+    def __init__(self, in_channels: int = 256):
+        super().__init__()
+        self.center_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+        )
+        self.offset_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 2, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        center_logits = self.center_head(x)  # [B, 1, H, W]
+        offset = self.offset_head(x)  # [B, 2, H, W]
+        return {"pred_center": center_logits, "pred_offset": offset}
+
+
 class LeafInstanceSegModel(nn.Module):
     def __init__(
         self,
@@ -156,6 +180,7 @@ class LeafInstanceSegModel(nn.Module):
         pretrained: bool = True,
         input_size: int = 512,
         upsample_masks_to_input: bool = True,
+        enable_aux_heads: bool = False,
     ):
         super().__init__()
         self.backbone = SwinBackbone(pretrained=pretrained, input_size=input_size)
@@ -167,6 +192,8 @@ class LeafInstanceSegModel(nn.Module):
             mask_embed_dim=mask_embed_dim,
         )
         self.upsample_masks_to_input = upsample_masks_to_input
+        self.enable_aux_heads = bool(enable_aux_heads)
+        self.aux_head = AuxiliaryGeometryHead(in_channels=hidden_dim) if self.enable_aux_heads else None
 
     def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         feats = self.backbone(image)
@@ -174,18 +201,38 @@ class LeafInstanceSegModel(nn.Module):
         head_out = self.mask_head(neck_out["mask_feature"])
 
         pred_masks = head_out["pred_masks"]
+        out_dict = {
+            "pred_logits": head_out["pred_logits"],
+            "pred_masks": pred_masks,
+        }
+
+        if self.enable_aux_heads and self.aux_head is not None:
+            aux_out = self.aux_head(neck_out["mask_feature"])
+            out_dict["pred_center"] = aux_out["pred_center"]
+            out_dict["pred_offset"] = aux_out["pred_offset"]
+
         if self.upsample_masks_to_input:
-            pred_masks = F.interpolate(
-                pred_masks,
+            out_dict["pred_masks"] = F.interpolate(
+                out_dict["pred_masks"],
                 size=image.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
-
-        return {
-            "pred_logits": head_out["pred_logits"],
-            "pred_masks": pred_masks,
-        }
+            if "pred_center" in out_dict:
+                out_dict["pred_center"] = F.interpolate(
+                    out_dict["pred_center"],
+                    size=image.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            if "pred_offset" in out_dict:
+                out_dict["pred_offset"] = F.interpolate(
+                    out_dict["pred_offset"],
+                    size=image.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        return out_dict
 
 
 if __name__ == "__main__":
@@ -197,6 +244,7 @@ if __name__ == "__main__":
         pretrained=False,
         input_size=512,
         upsample_masks_to_input=True,
+        enable_aux_heads=True,
     )
     model.eval()
 
@@ -206,3 +254,7 @@ if __name__ == "__main__":
 
     print("pred_logits.shape:", out["pred_logits"].shape)
     print("pred_masks.shape:", out["pred_masks"].shape)
+    if "pred_center" in out:
+        print("pred_center.shape:", out["pred_center"].shape)
+    if "pred_offset" in out:
+        print("pred_offset.shape:", out["pred_offset"].shape)
