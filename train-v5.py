@@ -82,6 +82,14 @@ def parse_args():
     parser.add_argument("--max_val_steps", type=int, default=0, help="0 means no limit.")
     parser.add_argument("--num_workers_pin_memory", action="store_true", default=True)
     parser.add_argument("--no_tqdm", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--enable_patch_scale_weighting",
+        action="store_true",
+        help="Use weighted sampling to increase exposure of larger patch scales during training.",
+    )
+    parser.add_argument("--patch_scale_weight_512", type=float, default=1.0, help="Sampling weight for 512 patches.")
+    parser.add_argument("--patch_scale_weight_768", type=float, default=1.5, help="Sampling weight for 768 patches.")
+    parser.add_argument("--patch_scale_weight_1024", type=float, default=2.5, help="Sampling weight for 1024 patches.")
     return parser.parse_args()
 
 
@@ -93,7 +101,12 @@ def set_seed(seed: int):
 
 
 def select_device(device_arg: str) -> torch.device:
-    if device_arg.startswith("cuda") and torch.cuda.is_available():
+    if device_arg.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device requested (`{device_arg}`) but CUDA is not available. "
+                "Please check your CUDA/PyTorch installation or pass --device cpu explicitly."
+            )
         return torch.device(device_arg)
     return torch.device("cpu")
 
@@ -709,6 +722,10 @@ def main():
         f"w_center={args.w_center}, w_offset={args.w_offset}, "
         f"center_sigma={args.center_sigma}, offset_clip={args.offset_clip}"
     )
+    print(
+        f"[INFO] Patch-scale weighting: enable={bool(args.enable_patch_scale_weighting)}, "
+        f"w512={args.patch_scale_weight_512}, w768={args.patch_scale_weight_768}, w1024={args.patch_scale_weight_1024}"
+    )
 
     train_transform = get_train_transform(target_size=args.input_size)
     val_transform = get_val_transform(target_size=args.input_size)
@@ -720,14 +737,29 @@ def main():
         seed=args.seed,
         remap_instance_ids=False,
         skip_empty=False,
+        enable_patch_scale_weighting=bool(args.enable_patch_scale_weighting),
+        patch_scale_weights={
+            512: float(args.patch_scale_weight_512),
+            768: float(args.patch_scale_weight_768),
+            1024: float(args.patch_scale_weight_1024),
+        },
     )
     print(f"[INFO] Train samples: {len(train_ds)}")
     print(f"[INFO] Val samples: {len(val_ds)}")
 
+    train_sampler = None
+    train_shuffle = True
+    if bool(args.enable_patch_scale_weighting):
+        train_sampler = train_ds.build_weighted_sampler(num_samples=len(train_ds), replacement=True)
+        train_shuffle = False
+        sampling_summary = train_ds.get_patch_scale_sampling_summary()
+        print(f"[INFO] Patch-scale sampling summary: {sampling_summary}")
+
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=bool(args.num_workers_pin_memory),
         persistent_workers=bool(args.persistent_workers and args.num_workers > 0),

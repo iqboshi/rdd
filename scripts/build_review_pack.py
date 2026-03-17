@@ -51,6 +51,17 @@ def parse_args():
     parser.add_argument("--nms_iou_thresh", type=float, default=0.65)
     parser.add_argument("--contain_thresh", type=float, default=0.75)
     parser.add_argument("--min_area", type=int, default=25)
+    parser.add_argument("--enable_center_stitching", action="store_true", help="Merge split masks via offset-predicted centers.")
+    parser.add_argument("--center_merge_dist", type=float, default=26.0, help="Center distance threshold for stitching.")
+    parser.add_argument("--edge_gap_dist", type=float, default=22.0, help="Max edge distance between masks for stitching.")
+    parser.add_argument("--center_sample_min", type=int, default=30, help="Min pixels in a mask to estimate offset center.")
+    parser.add_argument("--center_spread_max", type=float, default=14.0, help="Max median center-vote spread; larger means less reliable center.")
+    parser.add_argument("--stitch_use_center_peak", action="store_true", help="Require center-peak consistency when center head exists (A-v3).")
+    parser.add_argument("--center_peak_thresh", type=float, default=0.35, help="Center heatmap peak threshold for peak-consistency stitching.")
+    parser.add_argument("--center_peak_min_dist", type=int, default=6, help="Minimum distance (px) between center peaks.")
+    parser.add_argument("--peak_assign_dist", type=float, default=24.0, help="Max distance from instance center-vote to assigned center peak.")
+    parser.add_argument("--axis_sim_thresh", type=float, default=0.45, help="Min cosine similarity of mask major axes for stitching.")
+    parser.add_argument("--connect_align_thresh", type=float, default=0.35, help="Min alignment between major axis and pair-connection direction.")
     parser.add_argument("--no_tqdm", action="store_true")
     return parser.parse_args()
 
@@ -86,9 +97,14 @@ def infer_model_hparams_from_state(state: Dict[str, torch.Tensor]) -> Dict[str, 
     }
 
 
+def checkpoint_has_aux_heads(state: Dict[str, torch.Tensor]) -> bool:
+    return any(str(k).startswith("aux_head.") for k in state.keys())
+
+
 def build_model_from_checkpoint(checkpoint_path: Path, input_size: int, device: torch.device):
     state = load_checkpoint_state(checkpoint_path)
     hp = infer_model_hparams_from_state(state)
+    has_aux = checkpoint_has_aux_heads(state)
     model = LeafInstanceSegModel(
         num_queries=hp["num_queries"],
         hidden_dim=hp["hidden_dim"],
@@ -97,9 +113,11 @@ def build_model_from_checkpoint(checkpoint_path: Path, input_size: int, device: 
         pretrained=False,
         input_size=input_size,
         upsample_masks_to_input=True,
+        enable_aux_heads=has_aux,
     )
     model.load_state_dict(state, strict=False)
     model.to(device).eval()
+    print(f"[INFO] Auxiliary heads in ckpt: {has_aux}")
     return model
 
 
@@ -171,6 +189,253 @@ def run_postprocess(
     kept = [x for x in kept if x["area"] >= int(min_area)]
     counts["after_min_area"] = len(kept)
     return kept, counts
+
+
+def min_edge_distance(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    if np.logical_and(mask_a, mask_b).any():
+        return 0.0
+    inv = (~mask_a).astype(np.uint8)
+    dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
+    vals = dist[mask_b]
+    if vals.size == 0:
+        return float("inf")
+    return float(vals.min())
+
+
+def estimate_center_from_offset(mask_bin: np.ndarray, pred_offset_hw2: np.ndarray, center_sample_min: int = 30):
+    ys, xs = np.where(mask_bin)
+    if ys.size < int(center_sample_min):
+        return None
+    dy = pred_offset_hw2[ys, xs, 0].astype(np.float32)
+    dx = pred_offset_hw2[ys, xs, 1].astype(np.float32)
+    cy_votes = ys.astype(np.float32) + dy
+    cx_votes = xs.astype(np.float32) + dx
+    cx = float(np.median(cx_votes))
+    cy = float(np.median(cy_votes))
+    spread = float(np.median(np.sqrt((cx_votes - cx) ** 2 + (cy_votes - cy) ** 2)))
+    return {
+        "center": (cx, cy),
+        "spread": spread,
+        "num_votes": int(cx_votes.size),
+    }
+
+
+def extract_mask_axis(mask_bin: np.ndarray):
+    ys, xs = np.where(mask_bin)
+    if ys.size < 8:
+        return None
+    pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid[None, :]
+    denom = max(int(centered.shape[0] - 1), 1)
+    cov = (centered.T @ centered) / float(denom)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    major_val = float(eigvals[order[0]])
+    minor_val = float(eigvals[order[1]])
+    axis = eigvecs[:, order[0]].astype(np.float32)
+    axis_norm = float(np.linalg.norm(axis))
+    if axis_norm <= 1e-6:
+        return None
+    axis = axis / axis_norm
+    elongation = float(np.sqrt((major_val + 1e-6) / (minor_val + 1e-6)))
+    return {
+        "centroid": (float(centroid[0]), float(centroid[1])),
+        "axis": (float(axis[0]), float(axis[1])),
+        "elongation": elongation,
+    }
+
+
+def detect_center_peaks(center_prob_hw: np.ndarray, peak_thresh: float = 0.35, min_dist: int = 6, max_peaks: int = 128):
+    if center_prob_hw is None:
+        return []
+    center_prob_hw = np.asarray(center_prob_hw, dtype=np.float32)
+    if center_prob_hw.ndim != 2:
+        return []
+
+    h, w = center_prob_hw.shape
+    min_dist = max(1, int(min_dist))
+    k = int(2 * min_dist + 1)
+    kernel = np.ones((k, k), dtype=np.uint8)
+    local_max = cv2.dilate(center_prob_hw, kernel) == center_prob_hw
+    cand = np.logical_and(local_max, center_prob_hw >= float(peak_thresh))
+    ys, xs = np.where(cand)
+    if ys.size == 0:
+        return []
+
+    order = np.argsort(center_prob_hw[ys, xs])[::-1]
+    occupied = np.zeros((h, w), dtype=np.uint8)
+    peaks = []
+    for idx in order.tolist():
+        y = int(ys[idx])
+        x = int(xs[idx])
+        if occupied[y, x] != 0:
+            continue
+        peaks.append((float(x), float(y), float(center_prob_hw[y, x])))
+        cv2.circle(occupied, (x, y), int(min_dist), color=1, thickness=-1)
+        if len(peaks) >= int(max_peaks):
+            break
+    return peaks
+
+
+def assign_center_peak(center_xy, peaks, assign_dist: float = 24.0):
+    if center_xy is None or len(peaks) == 0:
+        return -1, float("inf")
+    cx, cy = center_xy
+    best_id = -1
+    best_dist = float("inf")
+    for i, (px, py, _score) in enumerate(peaks):
+        d = float(np.hypot(cx - px, cy - py))
+        if d < best_dist:
+            best_dist = d
+            best_id = int(i)
+    if best_dist <= float(assign_dist):
+        return best_id, best_dist
+    return -1, best_dist
+
+
+def stitch_instances_by_center(
+    final_instances: List[Dict],
+    pred_offset_hw2: np.ndarray,
+    pred_center_hw: np.ndarray = None,
+    center_merge_dist: float = 26.0,
+    edge_gap_dist: float = 22.0,
+    center_sample_min: int = 30,
+    center_spread_max: float = 14.0,
+    stitch_use_center_peak: bool = False,
+    center_peak_thresh: float = 0.35,
+    center_peak_min_dist: int = 6,
+    peak_assign_dist: float = 24.0,
+    axis_sim_thresh: float = 0.45,
+    connect_align_thresh: float = 0.35,
+) -> Tuple[List[Dict], int]:
+    if len(final_instances) <= 1:
+        return final_instances, 0
+
+    center_infos = [
+        estimate_center_from_offset(
+            item["mask_bin"],
+            pred_offset_hw2=pred_offset_hw2,
+            center_sample_min=center_sample_min,
+        )
+        for item in final_instances
+    ]
+    axis_infos = [extract_mask_axis(item["mask_bin"]) for item in final_instances]
+
+    peaks = []
+    peak_ids = [-1] * len(final_instances)
+    use_peak_consistency = bool(stitch_use_center_peak and pred_center_hw is not None)
+    if use_peak_consistency:
+        peaks = detect_center_peaks(
+            center_prob_hw=pred_center_hw,
+            peak_thresh=center_peak_thresh,
+            min_dist=center_peak_min_dist,
+        )
+        for i, info in enumerate(center_infos):
+            if info is None:
+                continue
+            if float(center_spread_max) > 0 and float(info["spread"]) > float(center_spread_max):
+                continue
+            peak_id, _ = assign_center_peak(info["center"], peaks, assign_dist=peak_assign_dist)
+            peak_ids[i] = int(peak_id)
+
+    parent = list(range(len(final_instances)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(final_instances)):
+        info_i = center_infos[i]
+        if info_i is None:
+            continue
+        if float(center_spread_max) > 0 and float(info_i["spread"]) > float(center_spread_max):
+            continue
+        center_i = info_i["center"]
+        axis_i = axis_infos[i]
+        for j in range(i + 1, len(final_instances)):
+            info_j = center_infos[j]
+            if info_j is None:
+                continue
+            if float(center_spread_max) > 0 and float(info_j["spread"]) > float(center_spread_max):
+                continue
+            center_j = info_j["center"]
+            axis_j = axis_infos[j]
+
+            d_center = np.hypot(center_i[0] - center_j[0], center_i[1] - center_j[1])
+            if d_center > float(center_merge_dist):
+                continue
+            d_edge = min_edge_distance(final_instances[i]["mask_bin"], final_instances[j]["mask_bin"])
+            if d_edge > float(edge_gap_dist):
+                continue
+
+            if use_peak_consistency:
+                peak_i = peak_ids[i]
+                peak_j = peak_ids[j]
+                if peak_i >= 0 or peak_j >= 0:
+                    if peak_i != peak_j:
+                        continue
+
+            if float(axis_sim_thresh) > 0 and axis_i is not None and axis_j is not None:
+                vec_i = np.asarray(axis_i["axis"], dtype=np.float32)
+                vec_j = np.asarray(axis_j["axis"], dtype=np.float32)
+                axis_sim = float(abs(np.dot(vec_i, vec_j)))
+                if axis_sim < float(axis_sim_thresh):
+                    continue
+
+            if float(connect_align_thresh) > 0 and (axis_i is not None or axis_j is not None):
+                pi = np.asarray(axis_i["centroid"] if axis_i is not None else center_i, dtype=np.float32)
+                pj = np.asarray(axis_j["centroid"] if axis_j is not None else center_j, dtype=np.float32)
+                link = pj - pi
+                norm = float(np.linalg.norm(link))
+                if norm > 1e-6:
+                    link = link / norm
+                    aligns = []
+                    if axis_i is not None:
+                        aligns.append(float(abs(np.dot(np.asarray(axis_i["axis"], dtype=np.float32), link))))
+                    if axis_j is not None:
+                        aligns.append(float(abs(np.dot(np.asarray(axis_j["axis"], dtype=np.float32), link))))
+                    if len(aligns) > 0 and max(aligns) < float(connect_align_thresh):
+                        continue
+            union(i, j)
+
+    groups = {}
+    for idx in range(len(final_instances)):
+        root = find(idx)
+        groups.setdefault(root, []).append(idx)
+
+    merged = []
+    stitched_pairs = 0
+    for idxs in groups.values():
+        if len(idxs) == 1:
+            merged.append(final_instances[idxs[0]])
+            continue
+        stitched_pairs += len(idxs) - 1
+        mask_union = np.zeros_like(final_instances[idxs[0]]["mask_bin"], dtype=bool)
+        score = 0.0
+        qidx = -1
+        for k in idxs:
+            mask_union = np.logical_or(mask_union, final_instances[k]["mask_bin"])
+            if float(final_instances[k]["score"]) >= score:
+                score = float(final_instances[k]["score"])
+                qidx = int(final_instances[k]["query_idx"])
+        merged.append(
+            {
+                "query_idx": qidx,
+                "score": score,
+                "mask_prob": None,
+                "mask_bin": mask_union,
+                "area": int(mask_union.sum()),
+            }
+        )
+    return merged, stitched_pairs
 
 
 def build_instance_map(final_instances: List[Dict], h: int, w: int) -> np.ndarray:
@@ -395,6 +660,17 @@ def main():
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Total candidates: {len(samples)}")
     print(f"[INFO] Building difficulty stats...")
+    print(
+        f"[INFO] Center stitching: enable={bool(args.enable_center_stitching)}, "
+        f"center_merge_dist={args.center_merge_dist}, edge_gap_dist={args.edge_gap_dist}, "
+        f"center_sample_min={args.center_sample_min}, center_spread_max={args.center_spread_max}"
+    )
+    print(
+        f"[INFO] A3 stitching constraints: peak={bool(args.stitch_use_center_peak)}, "
+        f"peak_thresh={args.center_peak_thresh}, peak_min_dist={args.center_peak_min_dist}, "
+        f"peak_assign_dist={args.peak_assign_dist}, axis_sim_thresh={args.axis_sim_thresh}, "
+        f"connect_align_thresh={args.connect_align_thresh}"
+    )
 
     metric_rows = []
     metric_iter = tqdm(samples, disable=bool(args.no_tqdm), dynamic_ncols=True, desc="Compute difficulty")
@@ -428,6 +704,12 @@ def main():
             outputs = model(image_t)
             pred_logits = outputs["pred_logits"][0]
             pred_masks = outputs["pred_masks"][0]
+            pred_offset = None
+            pred_center = None
+            if "pred_offset" in outputs:
+                pred_offset = outputs["pred_offset"][0].detach().cpu().numpy().transpose(1, 2, 0)
+            if "pred_center" in outputs:
+                pred_center = outputs["pred_center"][0, 0].sigmoid().detach().cpu().numpy()
 
             final_instances, counts = run_postprocess(
                 pred_logits_qc=pred_logits,
@@ -445,6 +727,31 @@ def main():
                     m = cv2.resize(m, (w0, h0), interpolation=cv2.INTER_NEAREST)
                     item["mask_bin"] = m > 0
                     item["area"] = int(item["mask_bin"].sum())
+                if pred_offset is not None:
+                    pred_offset = cv2.resize(pred_offset, (w0, h0), interpolation=cv2.INTER_LINEAR)
+                if pred_center is not None:
+                    pred_center = cv2.resize(pred_center, (w0, h0), interpolation=cv2.INTER_LINEAR)
+
+            stitched_pairs = 0
+            if bool(args.enable_center_stitching):
+                if pred_offset is None:
+                    print("[WARN] Center stitching requested but checkpoint has no pred_offset head. Skipped.")
+                else:
+                    final_instances, stitched_pairs = stitch_instances_by_center(
+                        final_instances,
+                        pred_offset_hw2=pred_offset,
+                        pred_center_hw=pred_center,
+                        center_merge_dist=args.center_merge_dist,
+                        edge_gap_dist=args.edge_gap_dist,
+                        center_sample_min=args.center_sample_min,
+                        center_spread_max=args.center_spread_max,
+                        stitch_use_center_peak=bool(args.stitch_use_center_peak),
+                        center_peak_thresh=args.center_peak_thresh,
+                        center_peak_min_dist=args.center_peak_min_dist,
+                        peak_assign_dist=args.peak_assign_dist,
+                        axis_sim_thresh=args.axis_sim_thresh,
+                        connect_align_thresh=args.connect_align_thresh,
+                    )
 
             pred_inst_map = build_instance_map(final_instances, h=h0, w=w0)
             panel = make_panel(image_rgb=image_rgb, pred_inst_map=pred_inst_map, gt_inst_map=gt_inst_map)
@@ -454,7 +761,8 @@ def main():
             text = (
                 f"#{idx:02d} [{bucket}] {image_path.name} | scale={sample['patch_scale']} "
                 f"| gt_inst={d['inst_count']} | touch={d['touch_ratio']:.2f} "
-                f"| highlight={d['highlight_ratio']:.3f} | pred_inst={int(np.max(pred_inst_map))}"
+                f"| highlight={d['highlight_ratio']:.3f} | pred_inst={int(np.max(pred_inst_map))} "
+                f"| stitched={stitched_pairs}"
             )
             cv2.rectangle(panel_bgr, (0, 0), (panel_bgr.shape[1], 32), (18, 18, 18), thickness=-1)
             cv2.putText(panel_bgr, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
@@ -492,6 +800,7 @@ def main():
                     "after_nms": counts["after_nms"],
                     "after_contain": counts["after_contain"],
                     "after_min_area": counts["after_min_area"],
+                    "stitched_pairs": int(stitched_pairs),
                 }
             )
 
@@ -514,6 +823,17 @@ def main():
             "nms_iou_thresh": args.nms_iou_thresh,
             "contain_thresh": args.contain_thresh,
             "min_area": args.min_area,
+            "enable_center_stitching": bool(args.enable_center_stitching),
+            "center_merge_dist": args.center_merge_dist,
+            "edge_gap_dist": args.edge_gap_dist,
+            "center_sample_min": args.center_sample_min,
+            "center_spread_max": args.center_spread_max,
+            "stitch_use_center_peak": bool(args.stitch_use_center_peak),
+            "center_peak_thresh": args.center_peak_thresh,
+            "center_peak_min_dist": args.center_peak_min_dist,
+            "peak_assign_dist": args.peak_assign_dist,
+            "axis_sim_thresh": args.axis_sim_thresh,
+            "connect_align_thresh": args.connect_align_thresh,
         },
         "selection": {
             "num_samples": len(manifest_rows),
