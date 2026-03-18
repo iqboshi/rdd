@@ -53,6 +53,7 @@ try {
     (Join-Path $sourceRoot '.git'),
     (Join-Path $sourceRoot '.repo_publish_tmp'),
     (Join-Path $sourceRoot '.repo_tag_tmp'),
+    $tempRepo,
     (Join-Path $sourceRoot '.tmp'),
     (Join-Path $sourceRoot '__pycache__'),
     (Join-Path $sourceRoot 'data'),
@@ -61,6 +62,12 @@ try {
     (Join-Path $sourceRoot 'rdd-dev'),
     (Join-Path $sourceRoot 'pretrain_riceseg\outputs')
   )
+  $dynamicTmpDirs = Get-ChildItem -Path $sourceRoot -Directory -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like '.repo_tag_tmp*' -or $_.Name -like '.repo_publish_tmp*' } |
+    Select-Object -ExpandProperty FullName
+  if ($dynamicTmpDirs) {
+    $excludeDirs += $dynamicTmpDirs
+  }
   $excludeFiles = @('*.pth','*.pt','*.ckpt','*.onnx','*.bin','*.safetensors','*.npy','*.npz','*.pyc')
 
   Write-Host '[STEP] Running robocopy sync'
