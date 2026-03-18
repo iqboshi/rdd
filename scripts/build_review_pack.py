@@ -62,6 +62,27 @@ def parse_args():
     parser.add_argument("--peak_assign_dist", type=float, default=24.0, help="Max distance from instance center-vote to assigned center peak.")
     parser.add_argument("--axis_sim_thresh", type=float, default=0.45, help="Min cosine similarity of mask major axes for stitching.")
     parser.add_argument("--connect_align_thresh", type=float, default=0.35, help="Min alignment between major axis and pair-connection direction.")
+    parser.add_argument(
+        "--enable_center_split",
+        action="store_true",
+        help="Split potentially merged instances using center peaks + offset votes.",
+    )
+    parser.add_argument("--split_peak_thresh", type=float, default=0.42, help="Center peak threshold for merge-splitting.")
+    parser.add_argument("--split_peak_min_dist", type=int, default=10, help="Minimum center-peak distance for merge-splitting.")
+    parser.add_argument("--split_vote_radius", type=float, default=12.0, help="Vote radius used to validate split peaks.")
+    parser.add_argument("--split_peak_min_votes", type=int, default=90, help="Minimum vote support per split peak.")
+    parser.add_argument("--split_assign_radius", type=float, default=28.0, help="Vote-distance radius for assigning pixels to peaks.")
+    parser.add_argument("--split_min_pixels", type=int, default=110, help="Minimum pixels per split part.")
+    parser.add_argument("--split_second_min_pixels", type=int, default=70, help="Second-largest split part must exceed this.")
+    parser.add_argument("--split_second_support_ratio", type=float, default=0.18, help="Second-largest peak support ratio threshold.")
+    parser.add_argument("--split_min_peak_separation", type=float, default=20.0, help="Minimum separation between kept peaks.")
+    parser.add_argument(
+        "--split_max_elongation",
+        type=float,
+        default=2.8,
+        help="Only split instances with elongation <= this value (to avoid splitting long single leaves).",
+    )
+    parser.add_argument("--split_max_parts", type=int, default=4, help="Maximum number of parts kept when splitting one instance.")
     parser.add_argument("--no_tqdm", action="store_true")
     return parser.parse_args()
 
@@ -294,6 +315,176 @@ def assign_center_peak(center_xy, peaks, assign_dist: float = 24.0):
     return -1, best_dist
 
 
+def extract_largest_component(mask_bin: np.ndarray) -> np.ndarray:
+    m = mask_bin.astype(np.uint8)
+    if int(m.sum()) == 0:
+        return mask_bin.astype(bool)
+    num_labels, labels = cv2.connectedComponents(m, connectivity=8)
+    if num_labels <= 2:
+        return mask_bin.astype(bool)
+    best_label = 1
+    best_area = 0
+    for lid in range(1, int(num_labels)):
+        area = int((labels == lid).sum())
+        if area > best_area:
+            best_area = area
+            best_label = lid
+    return labels == int(best_label)
+
+
+def split_instances_by_center_peaks(
+    final_instances: List[Dict],
+    pred_offset_hw2: np.ndarray,
+    pred_center_hw: np.ndarray,
+    split_peak_thresh: float = 0.42,
+    split_peak_min_dist: int = 10,
+    split_vote_radius: float = 12.0,
+    split_peak_min_votes: int = 90,
+    split_assign_radius: float = 28.0,
+    split_min_pixels: int = 110,
+    split_second_min_pixels: int = 70,
+    split_second_support_ratio: float = 0.18,
+    split_min_peak_separation: float = 20.0,
+    split_max_elongation: float = 2.8,
+    split_max_parts: int = 4,
+) -> Tuple[List[Dict], Dict[str, int]]:
+    stats = {"split_masks": 0, "split_added_instances": 0}
+    if len(final_instances) == 0:
+        return final_instances, stats
+    if pred_offset_hw2 is None or pred_center_hw is None:
+        return final_instances, stats
+
+    all_peaks = detect_center_peaks(
+        center_prob_hw=pred_center_hw,
+        peak_thresh=split_peak_thresh,
+        min_dist=split_peak_min_dist,
+        max_peaks=512,
+    )
+    if len(all_peaks) < 2:
+        return final_instances, stats
+
+    split_min_pixels = int(split_min_pixels)
+    split_second_min_pixels = int(split_second_min_pixels)
+    split_peak_min_votes = int(split_peak_min_votes)
+    split_max_parts = max(2, int(split_max_parts))
+
+    out_instances = []
+    for item in final_instances:
+        mask_bin = item["mask_bin"]
+        ys, xs = np.where(mask_bin)
+        if ys.size < max(split_min_pixels * 2, split_peak_min_votes):
+            out_instances.append(item)
+            continue
+
+        if float(split_max_elongation) > 0:
+            axis_info = extract_mask_axis(mask_bin)
+            if axis_info is not None and float(axis_info["elongation"]) > float(split_max_elongation):
+                out_instances.append(item)
+                continue
+
+        peaks_in_mask = []
+        h, w = mask_bin.shape
+        for px, py, ps in all_peaks:
+            xi = int(round(px))
+            yi = int(round(py))
+            if yi < 0 or yi >= h or xi < 0 or xi >= w:
+                continue
+            if mask_bin[yi, xi]:
+                peaks_in_mask.append((float(px), float(py), float(ps)))
+        if len(peaks_in_mask) < 2:
+            out_instances.append(item)
+            continue
+
+        peak_xy = np.asarray([[p[0], p[1]] for p in peaks_in_mask], dtype=np.float32)
+        dy = pred_offset_hw2[ys, xs, 0].astype(np.float32)
+        dx = pred_offset_hw2[ys, xs, 1].astype(np.float32)
+        vote_xy = np.stack([xs.astype(np.float32) + dx, ys.astype(np.float32) + dy], axis=1)
+
+        dist_vote_to_peak = np.linalg.norm(vote_xy[:, None, :] - peak_xy[None, :, :], axis=2)
+        support = (dist_vote_to_peak <= float(split_vote_radius)).sum(axis=0).astype(np.int32)
+        valid = np.where(support >= split_peak_min_votes)[0]
+        if valid.size < 2:
+            out_instances.append(item)
+            continue
+
+        order = np.argsort(support[valid])[::-1]
+        keep = valid[order[:split_max_parts]]
+        peak_xy = peak_xy[keep]
+        support = support[keep]
+        if peak_xy.shape[0] < 2:
+            out_instances.append(item)
+            continue
+
+        if float(split_min_peak_separation) > 0:
+            sep_ok = False
+            for i in range(int(peak_xy.shape[0])):
+                for j in range(i + 1, int(peak_xy.shape[0])):
+                    d = float(np.hypot(peak_xy[i, 0] - peak_xy[j, 0], peak_xy[i, 1] - peak_xy[j, 1]))
+                    if d >= float(split_min_peak_separation):
+                        sep_ok = True
+                        break
+                if sep_ok:
+                    break
+            if not sep_ok:
+                out_instances.append(item)
+                continue
+
+        sorted_support = np.sort(support)
+        if int(sorted_support[-2]) < split_second_min_pixels:
+            out_instances.append(item)
+            continue
+        second_ratio = float(sorted_support[-2]) / float(max(1, ys.size))
+        if second_ratio < float(split_second_support_ratio):
+            out_instances.append(item)
+            continue
+
+        dist_keep = np.linalg.norm(vote_xy[:, None, :] - peak_xy[None, :, :], axis=2)
+        assign = dist_keep.argmin(axis=1).astype(np.int32)
+        nearest = dist_keep[np.arange(dist_keep.shape[0]), assign]
+
+        far = nearest > float(split_assign_radius)
+        if np.any(far):
+            pix_xy = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+            dist_pix = np.linalg.norm(pix_xy[far, None, :] - peak_xy[None, :, :], axis=2)
+            assign[far] = dist_pix.argmin(axis=1).astype(np.int32)
+
+        parts = []
+        for k in range(int(peak_xy.shape[0])):
+            sel = assign == k
+            if int(sel.sum()) < split_min_pixels:
+                continue
+            part_mask = np.zeros_like(mask_bin, dtype=bool)
+            part_mask[ys[sel], xs[sel]] = True
+            part_mask = extract_largest_component(part_mask)
+            area = int(part_mask.sum())
+            if area < split_min_pixels:
+                continue
+            parts.append(
+                {
+                    "query_idx": int(item["query_idx"]),
+                    "score": float(item["score"]) * 0.995,
+                    "mask_prob": None,
+                    "mask_bin": part_mask,
+                    "area": area,
+                }
+            )
+
+        if len(parts) < 2:
+            out_instances.append(item)
+            continue
+
+        areas = sorted([int(p["area"]) for p in parts], reverse=True)
+        if int(areas[1]) < split_second_min_pixels:
+            out_instances.append(item)
+            continue
+
+        stats["split_masks"] += 1
+        stats["split_added_instances"] += (len(parts) - 1)
+        out_instances.extend(parts)
+
+    return out_instances, stats
+
+
 def stitch_instances_by_center(
     final_instances: List[Dict],
     pred_offset_hw2: np.ndarray,
@@ -474,6 +665,81 @@ def make_panel(image_rgb: np.ndarray, pred_inst_map: np.ndarray, gt_inst_map: np
     overlay = cv2.addWeighted(image_rgb, 0.65, pred_color, 0.35, 0.0)
     panel = np.concatenate([image_rgb, gt_color, pred_color, overlay], axis=1)
     return panel
+
+
+def compute_gt_fragmentation_metrics(gt_inst_map: np.ndarray, pred_inst_map: np.ndarray) -> Dict[str, float]:
+    gt_ids = np.unique(gt_inst_map)
+    gt_ids = gt_ids[gt_ids > 0]
+    if gt_ids.size == 0:
+        return {
+            "gt_eval_inst_count": 0,
+            "gt_frag_mean": 0.0,
+            "gt_split_mean": 0.0,
+            "gt_split_ratio": 0.0,
+            "gt_frag_max": 0,
+        }
+
+    frag_counts = []
+    split_counts = []
+    split_flags = []
+    for iid in gt_ids.tolist():
+        m = gt_inst_map == int(iid)
+        pred_ids = np.unique(pred_inst_map[m])
+        pred_ids = pred_ids[pred_ids > 0]
+        k = int(len(pred_ids))
+        frag_counts.append(k)
+        split_counts.append(max(0, k - 1))
+        split_flags.append(1 if k >= 2 else 0)
+
+    return {
+        "gt_eval_inst_count": int(len(frag_counts)),
+        "gt_frag_mean": float(np.mean(frag_counts)),
+        "gt_split_mean": float(np.mean(split_counts)),
+        "gt_split_ratio": float(np.mean(split_flags)),
+        "gt_frag_max": int(np.max(frag_counts) if len(frag_counts) > 0 else 0),
+    }
+
+
+def compute_pred_merge_metrics(gt_inst_map: np.ndarray, pred_inst_map: np.ndarray) -> Dict[str, float]:
+    pred_ids = np.unique(pred_inst_map)
+    pred_ids = pred_ids[pred_ids > 0]
+    gt_ids_all = np.unique(gt_inst_map)
+    gt_ids_all = gt_ids_all[gt_ids_all > 0]
+
+    if pred_ids.size == 0:
+        return {
+            "pred_eval_inst_count": 0,
+            "pred_merge_mean": 0.0,
+            "pred_merge_ratio": 0.0,
+            "pred_merge_max": 0,
+            "gt_merged_ratio": 0.0,
+        }
+
+    merge_extra_counts = []
+    merge_flags = []
+    merge_card = []
+    gt_merged_ids = set()
+
+    for pid in pred_ids.tolist():
+        m = pred_inst_map == int(pid)
+        ov_gt_ids = np.unique(gt_inst_map[m])
+        ov_gt_ids = ov_gt_ids[ov_gt_ids > 0]
+        k = int(len(ov_gt_ids))
+        merge_card.append(k)
+        merge_extra_counts.append(max(0, k - 1))
+        merge_flags.append(1 if k >= 2 else 0)
+        if k >= 2:
+            for gid in ov_gt_ids.tolist():
+                gt_merged_ids.add(int(gid))
+
+    gt_merged_ratio = float(len(gt_merged_ids)) / float(max(1, int(len(gt_ids_all))))
+    return {
+        "pred_eval_inst_count": int(len(pred_ids)),
+        "pred_merge_mean": float(np.mean(merge_extra_counts)),
+        "pred_merge_ratio": float(np.mean(merge_flags)),
+        "pred_merge_max": int(np.max(merge_card) if len(merge_card) > 0 else 0),
+        "gt_merged_ratio": gt_merged_ratio,
+    }
 
 
 def compute_sample_difficulty(sample: Dict) -> Dict:
@@ -671,6 +937,17 @@ def main():
         f"peak_assign_dist={args.peak_assign_dist}, axis_sim_thresh={args.axis_sim_thresh}, "
         f"connect_align_thresh={args.connect_align_thresh}"
     )
+    print(
+        f"[INFO] Center split: enable={bool(args.enable_center_split)}, "
+        f"peak_thresh={args.split_peak_thresh}, peak_min_dist={args.split_peak_min_dist}, "
+        f"vote_radius={args.split_vote_radius}, peak_min_votes={args.split_peak_min_votes}, "
+        f"assign_radius={args.split_assign_radius}, split_min_pixels={args.split_min_pixels}, "
+        f"split_second_min_pixels={args.split_second_min_pixels}, "
+        f"split_second_support_ratio={args.split_second_support_ratio}, "
+        f"split_min_peak_separation={args.split_min_peak_separation}, "
+        f"split_max_elongation={args.split_max_elongation}, "
+        f"split_max_parts={args.split_max_parts}"
+    )
 
     metric_rows = []
     metric_iter = tqdm(samples, disable=bool(args.no_tqdm), dynamic_ncols=True, desc="Compute difficulty")
@@ -733,6 +1010,27 @@ def main():
                     pred_center = cv2.resize(pred_center, (w0, h0), interpolation=cv2.INTER_LINEAR)
 
             stitched_pairs = 0
+            split_stats = {"split_masks": 0, "split_added_instances": 0}
+            if bool(args.enable_center_split):
+                if pred_offset is None or pred_center is None:
+                    print("[WARN] Center split requested but checkpoint lacks pred_offset/pred_center head. Skipped.")
+                else:
+                    final_instances, split_stats = split_instances_by_center_peaks(
+                        final_instances=final_instances,
+                        pred_offset_hw2=pred_offset,
+                        pred_center_hw=pred_center,
+                        split_peak_thresh=args.split_peak_thresh,
+                        split_peak_min_dist=args.split_peak_min_dist,
+                        split_vote_radius=args.split_vote_radius,
+                        split_peak_min_votes=args.split_peak_min_votes,
+                        split_assign_radius=args.split_assign_radius,
+                        split_min_pixels=args.split_min_pixels,
+                        split_second_min_pixels=args.split_second_min_pixels,
+                        split_second_support_ratio=args.split_second_support_ratio,
+                        split_min_peak_separation=args.split_min_peak_separation,
+                        split_max_elongation=args.split_max_elongation,
+                        split_max_parts=args.split_max_parts,
+                    )
             if bool(args.enable_center_stitching):
                 if pred_offset is None:
                     print("[WARN] Center stitching requested but checkpoint has no pred_offset head. Skipped.")
@@ -754,6 +1052,8 @@ def main():
                     )
 
             pred_inst_map = build_instance_map(final_instances, h=h0, w=w0)
+            frag_metrics = compute_gt_fragmentation_metrics(gt_inst_map=gt_inst_map, pred_inst_map=pred_inst_map)
+            merge_metrics = compute_pred_merge_metrics(gt_inst_map=gt_inst_map, pred_inst_map=pred_inst_map)
             panel = make_panel(image_rgb=image_rgb, pred_inst_map=pred_inst_map, gt_inst_map=gt_inst_map)
             panel_bgr = cv2.cvtColor(panel, cv2.COLOR_RGB2BGR)
 
@@ -762,7 +1062,8 @@ def main():
                 f"#{idx:02d} [{bucket}] {image_path.name} | scale={sample['patch_scale']} "
                 f"| gt_inst={d['inst_count']} | touch={d['touch_ratio']:.2f} "
                 f"| highlight={d['highlight_ratio']:.3f} | pred_inst={int(np.max(pred_inst_map))} "
-                f"| stitched={stitched_pairs}"
+                f"| s+={split_stats['split_added_instances']} | stitched={stitched_pairs} "
+                f"| split={frag_metrics['gt_split_mean']:.2f} | merge={merge_metrics['pred_merge_mean']:.2f}"
             )
             cv2.rectangle(panel_bgr, (0, 0), (panel_bgr.shape[1], 32), (18, 18, 18), thickness=-1)
             cv2.putText(panel_bgr, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
@@ -800,7 +1101,19 @@ def main():
                     "after_nms": counts["after_nms"],
                     "after_contain": counts["after_contain"],
                     "after_min_area": counts["after_min_area"],
+                    "split_masks": int(split_stats["split_masks"]),
+                    "split_added_instances": int(split_stats["split_added_instances"]),
                     "stitched_pairs": int(stitched_pairs),
+                    "gt_eval_inst_count": int(frag_metrics["gt_eval_inst_count"]),
+                    "gt_frag_mean": float(frag_metrics["gt_frag_mean"]),
+                    "gt_split_mean": float(frag_metrics["gt_split_mean"]),
+                    "gt_split_ratio": float(frag_metrics["gt_split_ratio"]),
+                    "gt_frag_max": int(frag_metrics["gt_frag_max"]),
+                    "pred_eval_inst_count": int(merge_metrics["pred_eval_inst_count"]),
+                    "pred_merge_mean": float(merge_metrics["pred_merge_mean"]),
+                    "pred_merge_ratio": float(merge_metrics["pred_merge_ratio"]),
+                    "pred_merge_max": int(merge_metrics["pred_merge_max"]),
+                    "gt_merged_ratio": float(merge_metrics["gt_merged_ratio"]),
                 }
             )
 
@@ -834,6 +1147,18 @@ def main():
             "peak_assign_dist": args.peak_assign_dist,
             "axis_sim_thresh": args.axis_sim_thresh,
             "connect_align_thresh": args.connect_align_thresh,
+            "enable_center_split": bool(args.enable_center_split),
+            "split_peak_thresh": args.split_peak_thresh,
+            "split_peak_min_dist": args.split_peak_min_dist,
+            "split_vote_radius": args.split_vote_radius,
+            "split_peak_min_votes": args.split_peak_min_votes,
+            "split_assign_radius": args.split_assign_radius,
+            "split_min_pixels": args.split_min_pixels,
+            "split_second_min_pixels": args.split_second_min_pixels,
+            "split_second_support_ratio": args.split_second_support_ratio,
+            "split_min_peak_separation": args.split_min_peak_separation,
+            "split_max_elongation": args.split_max_elongation,
+            "split_max_parts": args.split_max_parts,
         },
         "selection": {
             "num_samples": len(manifest_rows),

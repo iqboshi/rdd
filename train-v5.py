@@ -70,8 +70,158 @@ def parse_args():
     parser.add_argument("--enable_aux_heads", action="store_true", help="Enable center+offset auxiliary heads (A-v1).")
     parser.add_argument("--w_center", type=float, default=0.30, help="Weight for center heatmap BCE aux loss.")
     parser.add_argument("--w_offset", type=float, default=0.05, help="Weight for offset L1 aux loss.")
+    parser.add_argument(
+        "--w_vote_consistency",
+        type=float,
+        default=0.02,
+        help="Weight for instance center-vote consistency loss (A-v5).",
+    )
+    parser.add_argument(
+        "--w_separation",
+        type=float,
+        default=0.10,
+        help="Weight for boundary separation supervision loss (A-v6).",
+    )
+    parser.add_argument(
+        "--w_repulsion",
+        type=float,
+        default=0.02,
+        help="Weight for cross-instance vote repulsion loss on touching boundaries (A-v6).",
+    )
+    parser.add_argument(
+        "--w_conflict",
+        type=float,
+        default=0.0,
+        help="Weight for boundary conflict supervision loss (A7).",
+    )
+    parser.add_argument(
+        "--w_affinity",
+        type=float,
+        default=0.0,
+        help="Weight for pixel affinity embedding discriminative loss (A7).",
+    )
+    parser.add_argument(
+        "--w_overlap_excl",
+        type=float,
+        default=0.0,
+        help="Weight for mutual-exclusion overlap penalty on matched instance masks (A7).",
+    )
+    parser.add_argument(
+        "--vote_consistency_min_pixels",
+        type=int,
+        default=20,
+        help="Minimum pixels for an instance to participate in vote consistency loss.",
+    )
+    parser.add_argument(
+        "--vote_consistency_touch_boost",
+        type=float,
+        default=1.6,
+        help="Extra loss weight for instances touching patch borders (occlusion/truncation-prone).",
+    )
     parser.add_argument("--center_sigma", type=float, default=4.0, help="Sigma for center heatmap targets.")
     parser.add_argument("--offset_clip", type=float, default=64.0, help="Clip absolute target offset values.")
+    parser.add_argument(
+        "--separation_dilate",
+        type=int,
+        default=1,
+        help="Dilate radius (px) for GT separation target map.",
+    )
+    parser.add_argument(
+        "--separation_pos_weight",
+        type=float,
+        default=3.0,
+        help="Positive class weight for separation BCE.",
+    )
+    parser.add_argument(
+        "--separation_dice_weight",
+        type=float,
+        default=1.0,
+        help="Dice term multiplier inside separation loss.",
+    )
+    parser.add_argument(
+        "--repulsion_margin",
+        type=float,
+        default=6.0,
+        help="Minimum center-vote distance between touching different instances.",
+    )
+    parser.add_argument(
+        "--repulsion_max_pairs",
+        type=int,
+        default=6000,
+        help="Maximum sampled touching pixel pairs per batch element for repulsion loss.",
+    )
+    parser.add_argument(
+        "--conflict_dilate",
+        type=int,
+        default=2,
+        help="Dilate radius (px) for conflict target band.",
+    )
+    parser.add_argument(
+        "--conflict_pos_weight",
+        type=float,
+        default=2.5,
+        help="Positive class weight for conflict BCE.",
+    )
+    parser.add_argument(
+        "--conflict_dice_weight",
+        type=float,
+        default=1.0,
+        help="Dice term multiplier inside conflict loss.",
+    )
+    parser.add_argument(
+        "--affinity_dim",
+        type=int,
+        default=16,
+        help="Channel dimension for affinity embedding head.",
+    )
+    parser.add_argument(
+        "--affinity_min_pixels",
+        type=int,
+        default=24,
+        help="Minimum pixels per instance for affinity supervision.",
+    )
+    parser.add_argument(
+        "--affinity_margin_var",
+        type=float,
+        default=0.5,
+        help="Intra-instance embedding compactness margin.",
+    )
+    parser.add_argument(
+        "--affinity_margin_dist",
+        type=float,
+        default=1.5,
+        help="Inter-instance embedding separation margin.",
+    )
+    parser.add_argument(
+        "--affinity_dist_weight",
+        type=float,
+        default=1.0,
+        help="Weight for inter-instance term inside affinity loss.",
+    )
+    parser.add_argument(
+        "--affinity_reg_weight",
+        type=float,
+        default=0.001,
+        help="Weight for embedding norm regularization inside affinity loss.",
+    )
+    parser.add_argument(
+        "--affinity_max_instances",
+        type=int,
+        default=64,
+        help="Maximum number of instances sampled per image for affinity loss.",
+    )
+    parser.add_argument(
+        "--overlap_bg_margin",
+        type=float,
+        default=0.15,
+        help="Allowed summed mask probability margin on background pixels.",
+    )
+    parser.add_argument(
+        "--overlap_bg_weight",
+        type=float,
+        default=0.2,
+        help="Background term weight inside mutual-exclusion overlap loss.",
+    )
     parser.add_argument("--match_cls", type=float, default=1.0)
     parser.add_argument("--match_mask", type=float, default=1.0)
     parser.add_argument("--match_dice", type=float, default=1.0)
@@ -341,6 +491,347 @@ def build_center_offset_targets_for_batch(
     }
 
 
+def build_separation_targets_for_batch(
+    instance_maps: torch.Tensor,
+    device: torch.device,
+    dilate_radius: int = 1,
+) -> torch.Tensor:
+    """
+    Build a binary target map for boundaries between different leaf instances.
+    Only leaf-vs-leaf touching boundaries are treated as positives.
+    """
+    inst = instance_maps.to(device, non_blocking=True).long()
+    bsz, h, w = inst.shape
+    boundary = torch.zeros((bsz, h, w), dtype=torch.bool, device=device)
+
+    if h > 1:
+        top = inst[:, :-1, :]
+        bottom = inst[:, 1:, :]
+        m = (top > 0) & (bottom > 0) & (top != bottom)
+        boundary[:, :-1, :] |= m
+        boundary[:, 1:, :] |= m
+
+    if w > 1:
+        left = inst[:, :, :-1]
+        right = inst[:, :, 1:]
+        m = (left > 0) & (right > 0) & (left != right)
+        boundary[:, :, :-1] |= m
+        boundary[:, :, 1:] |= m
+
+    r = max(0, int(dilate_radius))
+    if r > 0:
+        k = 2 * r + 1
+        boundary_f = boundary.float().unsqueeze(1)
+        boundary_f = F.max_pool2d(boundary_f, kernel_size=k, stride=1, padding=r)
+        boundary = boundary_f.squeeze(1) > 0.5
+
+    return boundary.float()
+
+
+def build_conflict_targets_for_batch(
+    instance_maps: torch.Tensor,
+    device: torch.device,
+    dilate_radius: int = 2,
+) -> torch.Tensor:
+    """
+    Build ambiguity/conflict bands around boundaries where labels change.
+    This includes leaf-vs-leaf and leaf-vs-background boundaries.
+    """
+    inst = instance_maps.to(device, non_blocking=True).long()
+    bsz, h, w = inst.shape
+    boundary = torch.zeros((bsz, h, w), dtype=torch.bool, device=device)
+
+    if h > 1:
+        top = inst[:, :-1, :]
+        bottom = inst[:, 1:, :]
+        m = (top != bottom) & ((top > 0) | (bottom > 0))
+        boundary[:, :-1, :] |= m
+        boundary[:, 1:, :] |= m
+
+    if w > 1:
+        left = inst[:, :, :-1]
+        right = inst[:, :, 1:]
+        m = (left != right) & ((left > 0) | (right > 0))
+        boundary[:, :, :-1] |= m
+        boundary[:, :, 1:] |= m
+
+    r = max(0, int(dilate_radius))
+    if r > 0:
+        k = 2 * r + 1
+        boundary_f = boundary.float().unsqueeze(1)
+        boundary_f = F.max_pool2d(boundary_f, kernel_size=k, stride=1, padding=r)
+        boundary = boundary_f.squeeze(1) > 0.5
+
+    return boundary.float()
+
+
+def compute_boundary_repulsion_loss(
+    pred_offset: torch.Tensor,
+    instance_maps: torch.Tensor,
+    margin: float = 6.0,
+    max_pairs: int = 6000,
+) -> torch.Tensor:
+    """
+    For adjacent pixels that belong to different GT instances, encourage their
+    offset-voted centers to stay separated by at least `margin` pixels.
+    """
+    if pred_offset.ndim != 4 or pred_offset.shape[1] != 2:
+        raise ValueError(f"pred_offset should be [B,2,H,W], got {tuple(pred_offset.shape)}")
+
+    inst = instance_maps.to(pred_offset.device, non_blocking=True).long()
+    bsz, _, h, w = pred_offset.shape
+    margin = float(max(0.0, margin))
+    max_pairs = int(max(1, max_pairs))
+
+    total_loss = pred_offset.new_tensor(0.0)
+    valid_batches = 0
+
+    for b in range(bsz):
+        y0_parts = []
+        x0_parts = []
+        y1_parts = []
+        x1_parts = []
+
+        if h > 1:
+            top = inst[b, :-1, :]
+            bottom = inst[b, 1:, :]
+            m = (top > 0) & (bottom > 0) & (top != bottom)
+            yy, xx = torch.where(m)
+            if yy.numel() > 0:
+                y0_parts.append(yy)
+                x0_parts.append(xx)
+                y1_parts.append(yy + 1)
+                x1_parts.append(xx)
+
+        if w > 1:
+            left = inst[b, :, :-1]
+            right = inst[b, :, 1:]
+            m = (left > 0) & (right > 0) & (left != right)
+            yy, xx = torch.where(m)
+            if yy.numel() > 0:
+                y0_parts.append(yy)
+                x0_parts.append(xx)
+                y1_parts.append(yy)
+                x1_parts.append(xx + 1)
+
+        if len(y0_parts) == 0:
+            continue
+
+        y0 = torch.cat(y0_parts, dim=0)
+        x0 = torch.cat(x0_parts, dim=0)
+        y1 = torch.cat(y1_parts, dim=0)
+        x1 = torch.cat(x1_parts, dim=0)
+
+        n_pairs = int(y0.numel())
+        if n_pairs > max_pairs:
+            perm = torch.randperm(n_pairs, device=pred_offset.device)[:max_pairs]
+            y0 = y0[perm]
+            x0 = x0[perm]
+            y1 = y1[perm]
+            x1 = x1[perm]
+
+        dy0 = pred_offset[b, 0, y0, x0]
+        dx0 = pred_offset[b, 1, y0, x0]
+        dy1 = pred_offset[b, 0, y1, x1]
+        dx1 = pred_offset[b, 1, y1, x1]
+
+        vote_y0 = y0.float() + dy0
+        vote_x0 = x0.float() + dx0
+        vote_y1 = y1.float() + dy1
+        vote_x1 = x1.float() + dx1
+        dist = torch.sqrt((vote_y0 - vote_y1) ** 2 + (vote_x0 - vote_x1) ** 2 + 1e-6)
+        loss_b = F.relu(margin - dist).mean()
+
+        total_loss = total_loss + loss_b
+        valid_batches += 1
+
+    if valid_batches == 0:
+        return pred_offset.new_tensor(0.0)
+    return total_loss / float(valid_batches)
+
+
+def compute_affinity_embedding_loss(
+    pred_affinity: torch.Tensor,
+    instance_maps: torch.Tensor,
+    min_pixels: int = 24,
+    margin_var: float = 0.5,
+    margin_dist: float = 1.5,
+    dist_weight: float = 1.0,
+    reg_weight: float = 0.001,
+    max_instances: int = 64,
+) -> Dict[str, torch.Tensor]:
+    """
+    Discriminative embedding loss:
+    - pull pixels of the same instance together (variance term)
+    - push different instance centers apart (distance term)
+    """
+    if pred_affinity.ndim != 4:
+        raise ValueError(f"pred_affinity should be [B,D,H,W], got {tuple(pred_affinity.shape)}")
+
+    inst = instance_maps.to(pred_affinity.device, non_blocking=True).long()
+    bsz, _, _, _ = pred_affinity.shape
+    min_pixels = max(1, int(min_pixels))
+    max_instances = max(1, int(max_instances))
+
+    var_sum = pred_affinity.new_tensor(0.0)
+    dist_sum = pred_affinity.new_tensor(0.0)
+    reg_sum = pred_affinity.new_tensor(0.0)
+    valid_batches = 0
+    dist_batches = 0
+
+    for b in range(bsz):
+        emb = pred_affinity[b].permute(1, 2, 0).contiguous()  # [H, W, D]
+        ids = torch.unique(inst[b])
+        ids = ids[ids > 0]
+        if ids.numel() == 0:
+            continue
+        if ids.numel() > max_instances:
+            perm = torch.randperm(ids.numel(), device=ids.device)[:max_instances]
+            ids = ids[perm]
+
+        means = []
+        for ins_id in ids.tolist():
+            ys, xs = torch.where(inst[b] == int(ins_id))
+            if ys.numel() < min_pixels:
+                continue
+            vecs = emb[ys, xs]  # [N, D]
+            mu = vecs.mean(dim=0)
+            means.append(mu)
+
+            intra = torch.norm(vecs - mu.unsqueeze(0), dim=1)
+            var_term = F.relu(intra - float(margin_var)) ** 2
+            var_sum = var_sum + var_term.mean()
+
+        if len(means) == 0:
+            continue
+
+        centers = torch.stack(means, dim=0)  # [K, D]
+        reg_sum = reg_sum + centers.norm(dim=1).mean()
+        valid_batches += 1
+
+        if centers.shape[0] > 1:
+            dist_mat = torch.cdist(centers, centers, p=2)
+            eye = torch.eye(dist_mat.shape[0], dtype=torch.bool, device=dist_mat.device)
+            off_diag = dist_mat[~eye]
+            if off_diag.numel() > 0:
+                dist_term = F.relu(float(margin_dist) - off_diag) ** 2
+                dist_sum = dist_sum + dist_term.mean()
+                dist_batches += 1
+
+    if valid_batches == 0:
+        zero = pred_affinity.new_tensor(0.0)
+        return {"total": zero, "var": zero, "dist": zero, "reg": zero}
+
+    var = var_sum / float(valid_batches)
+    reg = reg_sum / float(valid_batches)
+    if dist_batches > 0:
+        dist = dist_sum / float(dist_batches)
+    else:
+        dist = pred_affinity.new_tensor(0.0)
+
+    total = var + float(dist_weight) * dist + float(reg_weight) * reg
+    return {"total": total, "var": var, "dist": dist, "reg": reg}
+
+
+def compute_mutual_exclusion_overlap_loss(
+    pred_masks: torch.Tensor,
+    matches: List[Tuple[torch.Tensor, torch.Tensor]],
+    instance_maps: torch.Tensor,
+    bg_margin: float = 0.15,
+    bg_weight: float = 0.2,
+) -> torch.Tensor:
+    """
+    Penalize excessive overlap among matched instance masks.
+    This directly targets mixed-color/impure instance regions.
+    """
+    if pred_masks.ndim != 4:
+        raise ValueError(f"pred_masks should be [B,Q,H,W], got {tuple(pred_masks.shape)}")
+
+    inst = instance_maps.to(pred_masks.device, non_blocking=True).long()
+    bsz, _, _, _ = pred_masks.shape
+    total = pred_masks.new_tensor(0.0)
+    valid = 0
+
+    for b in range(bsz):
+        row_ind, _ = matches[b]
+        if row_ind.numel() == 0:
+            continue
+
+        probs = pred_masks[b, row_ind].sigmoid()  # [N, H, W]
+        sum_probs = probs.sum(dim=0)
+        leaf = (inst[b] > 0).float()
+        bg = 1.0 - leaf
+
+        leaf_denom = leaf.sum().clamp(min=1.0)
+        loss_leaf = (F.relu(sum_probs - 1.0) * leaf).sum() / leaf_denom
+
+        loss_bg = pred_masks.new_tensor(0.0)
+        bg_denom = bg.sum()
+        if float(bg_denom.item()) > 0:
+            loss_bg = (F.relu(sum_probs - float(bg_margin)) * bg).sum() / bg_denom
+
+        total = total + loss_leaf + float(bg_weight) * loss_bg
+        valid += 1
+
+    if valid == 0:
+        return pred_masks.new_tensor(0.0)
+    return total / float(valid)
+
+
+def compute_vote_consistency_loss(
+    pred_offset: torch.Tensor,
+    instance_maps: torch.Tensor,
+    min_pixels: int = 20,
+    touch_boost: float = 1.6,
+) -> torch.Tensor:
+    """
+    Encourage all visible parts of one GT instance to vote for a compact center.
+    This is designed for occluded/truncated long leaves that tend to split.
+    """
+    if pred_offset.ndim != 4 or pred_offset.shape[1] != 2:
+        raise ValueError(f"pred_offset should be [B,2,H,W], got {tuple(pred_offset.shape)}")
+
+    inst = instance_maps.to(pred_offset.device, non_blocking=True).long()
+    bsz, _, h, w = pred_offset.shape
+    min_pixels = max(1, int(min_pixels))
+    touch_boost = float(max(1.0, touch_boost))
+
+    weighted_loss = pred_offset.new_tensor(0.0)
+    weight_sum = pred_offset.new_tensor(0.0)
+
+    for b in range(bsz):
+        ids = torch.unique(inst[b])
+        ids = ids[ids > 0]
+        for ins_id in ids.tolist():
+            ys, xs = torch.where(inst[b] == int(ins_id))
+            if ys.numel() < min_pixels:
+                continue
+
+            dy = pred_offset[b, 0, ys, xs]
+            dx = pred_offset[b, 1, ys, xs]
+            vote_y = ys.float() + dy
+            vote_x = xs.float() + dx
+
+            mean_y = vote_y.mean()
+            mean_x = vote_x.mean()
+            dist = torch.sqrt((vote_y - mean_y) ** 2 + (vote_x - mean_x) ** 2 + 1e-6)
+            inst_loss = dist.mean()
+
+            touching_border = bool(
+                (int(ys.min().item()) == 0)
+                or (int(ys.max().item()) == h - 1)
+                or (int(xs.min().item()) == 0)
+                or (int(xs.max().item()) == w - 1)
+            )
+            w_inst = touch_boost if touching_border else 1.0
+            weighted_loss = weighted_loss + float(w_inst) * inst_loss
+            weight_sum = weight_sum + float(w_inst)
+
+    if float(weight_sum.item()) <= 0:
+        return pred_offset.new_tensor(0.0)
+    return weighted_loss / weight_sum
+
+
 def tensor_image_to_rgb_uint8(image_tensor: torch.Tensor) -> np.ndarray:
     img = image_tensor.detach().cpu().float().numpy()
     if img.ndim == 3 and img.shape[0] in (1, 3, 4):
@@ -442,12 +933,24 @@ def init_csv_logger(csv_path: Path):
                     "train_dice",
                     "train_center",
                     "train_offset",
+                    "train_vote_consistency",
+                    "train_separation",
+                    "train_repulsion",
+                    "train_conflict",
+                    "train_affinity",
+                    "train_overlap_excl",
                     "val_total",
                     "val_cls",
                     "val_mask",
                     "val_dice",
                     "val_center",
                     "val_offset",
+                    "val_vote_consistency",
+                    "val_separation",
+                    "val_repulsion",
+                    "val_conflict",
+                    "val_affinity",
+                    "val_overlap_excl",
                     "lr",
                 ]
             )
@@ -564,6 +1067,12 @@ def run_one_epoch(
     total_dice = 0.0
     total_center = 0.0
     total_offset = 0.0
+    total_vote_consistency = 0.0
+    total_separation = 0.0
+    total_repulsion = 0.0
+    total_conflict = 0.0
+    total_affinity = 0.0
+    total_overlap_excl = 0.0
     steps = 0
     vis_saved = False
     autocast_enabled = bool(args.amp and device.type == "cuda")
@@ -606,6 +1115,12 @@ def run_one_epoch(
                 loss = loss_dict["loss"]
                 loss_center = torch.tensor(0.0, device=device)
                 loss_offset = torch.tensor(0.0, device=device)
+                loss_vote_consistency = torch.tensor(0.0, device=device)
+                loss_separation = torch.tensor(0.0, device=device)
+                loss_repulsion = torch.tensor(0.0, device=device)
+                loss_conflict = torch.tensor(0.0, device=device)
+                loss_affinity = torch.tensor(0.0, device=device)
+                loss_overlap_excl = torch.tensor(0.0, device=device)
 
                 if bool(args.enable_aux_heads):
                     if "pred_center" not in outputs or "pred_offset" not in outputs:
@@ -623,10 +1138,104 @@ def run_one_epoch(
                     offset_l1 = torch.abs(outputs["pred_offset"] - aux_targets["offset"])
                     denom = fg.sum().clamp(min=1.0)
                     loss_offset = (offset_l1 * fg).sum() / denom
-                    loss = loss + float(args.w_center) * loss_center + float(args.w_offset) * loss_offset
+                    loss_vote_consistency = compute_vote_consistency_loss(
+                        pred_offset=outputs["pred_offset"],
+                        instance_maps=batch["instance_map"],
+                        min_pixels=args.vote_consistency_min_pixels,
+                        touch_boost=args.vote_consistency_touch_boost,
+                    )
+
+                    if float(args.w_separation) > 0:
+                        if "pred_separation" not in outputs:
+                            raise RuntimeError(
+                                "w_separation > 0 but model outputs missing pred_separation. "
+                                "Please ensure model aux head includes separation branch."
+                            )
+                        sep_target = build_separation_targets_for_batch(
+                            instance_maps=batch["instance_map"],
+                            device=device,
+                            dilate_radius=args.separation_dilate,
+                        )
+                        pred_sep = outputs["pred_separation"].squeeze(1)
+                        pos_w = torch.tensor(float(args.separation_pos_weight), device=device)
+                        sep_bce = F.binary_cross_entropy_with_logits(pred_sep, sep_target, pos_weight=pos_w)
+                        sep_dice = dice_loss_from_logits(pred_sep, sep_target)
+                        loss_separation = sep_bce + float(args.separation_dice_weight) * sep_dice
+
+                    if float(args.w_repulsion) > 0:
+                        loss_repulsion = compute_boundary_repulsion_loss(
+                            pred_offset=outputs["pred_offset"],
+                            instance_maps=batch["instance_map"],
+                            margin=args.repulsion_margin,
+                            max_pairs=args.repulsion_max_pairs,
+                        )
+
+                    if float(args.w_conflict) > 0:
+                        if "pred_conflict" not in outputs:
+                            raise RuntimeError(
+                                "w_conflict > 0 but model outputs missing pred_conflict. "
+                                "Please ensure model aux head includes conflict branch."
+                            )
+                        conflict_target = build_conflict_targets_for_batch(
+                            instance_maps=batch["instance_map"],
+                            device=device,
+                            dilate_radius=args.conflict_dilate,
+                        )
+                        pred_conflict = outputs["pred_conflict"].squeeze(1)
+                        pos_w = torch.tensor(float(args.conflict_pos_weight), device=device)
+                        conflict_bce = F.binary_cross_entropy_with_logits(
+                            pred_conflict, conflict_target, pos_weight=pos_w
+                        )
+                        conflict_dice = dice_loss_from_logits(pred_conflict, conflict_target)
+                        loss_conflict = conflict_bce + float(args.conflict_dice_weight) * conflict_dice
+
+                    if float(args.w_affinity) > 0:
+                        if "pred_affinity" not in outputs:
+                            raise RuntimeError(
+                                "w_affinity > 0 but model outputs missing pred_affinity. "
+                                "Please ensure model aux head includes affinity branch."
+                            )
+                        aff = compute_affinity_embedding_loss(
+                            pred_affinity=outputs["pred_affinity"],
+                            instance_maps=batch["instance_map"],
+                            min_pixels=args.affinity_min_pixels,
+                            margin_var=args.affinity_margin_var,
+                            margin_dist=args.affinity_margin_dist,
+                            dist_weight=args.affinity_dist_weight,
+                            reg_weight=args.affinity_reg_weight,
+                            max_instances=args.affinity_max_instances,
+                        )
+                        loss_affinity = aff["total"]
+
+                    loss = (
+                        loss
+                        + float(args.w_center) * loss_center
+                        + float(args.w_offset) * loss_offset
+                        + float(args.w_vote_consistency) * loss_vote_consistency
+                        + float(args.w_separation) * loss_separation
+                        + float(args.w_repulsion) * loss_repulsion
+                        + float(args.w_conflict) * loss_conflict
+                        + float(args.w_affinity) * loss_affinity
+                    )
+
+                if float(args.w_overlap_excl) > 0:
+                    loss_overlap_excl = compute_mutual_exclusion_overlap_loss(
+                        pred_masks=outputs["pred_masks"],
+                        matches=loss_dict["matches"],
+                        instance_maps=batch["instance_map"],
+                        bg_margin=args.overlap_bg_margin,
+                        bg_weight=args.overlap_bg_weight,
+                    )
+                    loss = loss + float(args.w_overlap_excl) * loss_overlap_excl
 
                 loss_dict["loss_center"] = loss_center
                 loss_dict["loss_offset"] = loss_offset
+                loss_dict["loss_vote_consistency"] = loss_vote_consistency
+                loss_dict["loss_separation"] = loss_separation
+                loss_dict["loss_repulsion"] = loss_repulsion
+                loss_dict["loss_conflict"] = loss_conflict
+                loss_dict["loss_affinity"] = loss_affinity
+                loss_dict["loss_overlap_excl"] = loss_overlap_excl
                 loss_dict["loss"] = loss
 
             if train_mode:
@@ -645,6 +1254,12 @@ def run_one_epoch(
         total_dice += float(loss_dict["loss_dice"].detach().cpu().item())
         total_center += float(loss_dict["loss_center"].detach().cpu().item())
         total_offset += float(loss_dict["loss_offset"].detach().cpu().item())
+        total_vote_consistency += float(loss_dict["loss_vote_consistency"].detach().cpu().item())
+        total_separation += float(loss_dict["loss_separation"].detach().cpu().item())
+        total_repulsion += float(loss_dict["loss_repulsion"].detach().cpu().item())
+        total_conflict += float(loss_dict["loss_conflict"].detach().cpu().item())
+        total_affinity += float(loss_dict["loss_affinity"].detach().cpu().item())
+        total_overlap_excl += float(loss_dict["loss_overlap_excl"].detach().cpu().item())
         steps += 1
 
         progress.set_postfix(
@@ -654,6 +1269,12 @@ def run_one_epoch(
             dice=f"{loss_dict['loss_dice'].detach().cpu().item():.4f}",
             ctr=f"{loss_dict['loss_center'].detach().cpu().item():.4f}",
             off=f"{loss_dict['loss_offset'].detach().cpu().item():.4f}",
+            vcon=f"{loss_dict['loss_vote_consistency'].detach().cpu().item():.4f}",
+            sep=f"{loss_dict['loss_separation'].detach().cpu().item():.4f}",
+            rep=f"{loss_dict['loss_repulsion'].detach().cpu().item():.4f}",
+            cfl=f"{loss_dict['loss_conflict'].detach().cpu().item():.4f}",
+            aff=f"{loss_dict['loss_affinity'].detach().cpu().item():.4f}",
+            mex=f"{loss_dict['loss_overlap_excl'].detach().cpu().item():.4f}",
         )
 
         if (not vis_saved) and (args.vis_every > 0) and (epoch % args.vis_every == 0):
@@ -676,6 +1297,12 @@ def run_one_epoch(
             "loss_dice": 0.0,
             "loss_center": 0.0,
             "loss_offset": 0.0,
+            "loss_vote_consistency": 0.0,
+            "loss_separation": 0.0,
+            "loss_repulsion": 0.0,
+            "loss_conflict": 0.0,
+            "loss_affinity": 0.0,
+            "loss_overlap_excl": 0.0,
             "steps": 0,
         }
 
@@ -686,6 +1313,12 @@ def run_one_epoch(
         "loss_dice": total_dice / steps,
         "loss_center": total_center / steps,
         "loss_offset": total_offset / steps,
+        "loss_vote_consistency": total_vote_consistency / steps,
+        "loss_separation": total_separation / steps,
+        "loss_repulsion": total_repulsion / steps,
+        "loss_conflict": total_conflict / steps,
+        "loss_affinity": total_affinity / steps,
+        "loss_overlap_excl": total_overlap_excl / steps,
         "steps": steps,
     }
 
@@ -720,7 +1353,20 @@ def main():
     print(
         f"[INFO] Aux heads: enable={bool(args.enable_aux_heads)}, "
         f"w_center={args.w_center}, w_offset={args.w_offset}, "
-        f"center_sigma={args.center_sigma}, offset_clip={args.offset_clip}"
+        f"w_vote_consistency={args.w_vote_consistency}, "
+        f"w_separation={args.w_separation}, w_repulsion={args.w_repulsion}, "
+        f"w_conflict={args.w_conflict}, w_affinity={args.w_affinity}, "
+        f"w_overlap_excl={args.w_overlap_excl}, "
+        f"vote_min_pixels={args.vote_consistency_min_pixels}, "
+        f"vote_touch_boost={args.vote_consistency_touch_boost}, "
+        f"center_sigma={args.center_sigma}, offset_clip={args.offset_clip}, "
+        f"sep_dilate={args.separation_dilate}, sep_pos_weight={args.separation_pos_weight}, "
+        f"sep_dice_weight={args.separation_dice_weight}, repulsion_margin={args.repulsion_margin}, "
+        f"repulsion_max_pairs={args.repulsion_max_pairs}, "
+        f"conflict_dilate={args.conflict_dilate}, conflict_pos_weight={args.conflict_pos_weight}, "
+        f"affinity_dim={args.affinity_dim}, affinity_min_pixels={args.affinity_min_pixels}, "
+        f"affinity_margin_var={args.affinity_margin_var}, affinity_margin_dist={args.affinity_margin_dist}, "
+        f"overlap_bg_margin={args.overlap_bg_margin}, overlap_bg_weight={args.overlap_bg_weight}"
     )
     print(
         f"[INFO] Patch-scale weighting: enable={bool(args.enable_patch_scale_weighting)}, "
@@ -788,6 +1434,7 @@ def main():
         input_size=args.input_size,
         upsample_masks_to_input=True,
         enable_aux_heads=bool(args.enable_aux_heads),
+        aux_affinity_dim=args.affinity_dim,
     ).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -871,10 +1518,16 @@ def main():
             f"[Epoch {epoch:03d}/{args.epochs:03d}] "
             f"train_total={train_stats['loss']:.4f} "
             f"(cls={train_stats['loss_cls']:.4f}, mask={train_stats['loss_mask']:.4f}, dice={train_stats['loss_dice']:.4f}, "
-            f"center={train_stats['loss_center']:.4f}, offset={train_stats['loss_offset']:.4f}) | "
+            f"center={train_stats['loss_center']:.4f}, offset={train_stats['loss_offset']:.4f}, "
+            f"vote={train_stats['loss_vote_consistency']:.4f}, sep={train_stats['loss_separation']:.4f}, "
+            f"rep={train_stats['loss_repulsion']:.4f}, cfl={train_stats['loss_conflict']:.4f}, "
+            f"aff={train_stats['loss_affinity']:.4f}, mex={train_stats['loss_overlap_excl']:.4f}) | "
             f"val_total={val_stats['loss']:.4f} "
             f"(cls={val_stats['loss_cls']:.4f}, mask={val_stats['loss_mask']:.4f}, dice={val_stats['loss_dice']:.4f}, "
-            f"center={val_stats['loss_center']:.4f}, offset={val_stats['loss_offset']:.4f}) | "
+            f"center={val_stats['loss_center']:.4f}, offset={val_stats['loss_offset']:.4f}, "
+            f"vote={val_stats['loss_vote_consistency']:.4f}, sep={val_stats['loss_separation']:.4f}, "
+            f"rep={val_stats['loss_repulsion']:.4f}, cfl={val_stats['loss_conflict']:.4f}, "
+            f"aff={val_stats['loss_affinity']:.4f}, mex={val_stats['loss_overlap_excl']:.4f}) | "
             f"lr={lr_now:.6e} | time={elapsed:.1f}s"
         )
         print(msg)
@@ -889,15 +1542,31 @@ def main():
                 train_stats["loss_dice"],
                 train_stats["loss_center"],
                 train_stats["loss_offset"],
+                train_stats["loss_vote_consistency"],
+                train_stats["loss_separation"],
+                train_stats["loss_repulsion"],
+                train_stats["loss_conflict"],
+                train_stats["loss_affinity"],
+                train_stats["loss_overlap_excl"],
                 val_stats["loss"],
                 val_stats["loss_cls"],
                 val_stats["loss_mask"],
                 val_stats["loss_dice"],
                 val_stats["loss_center"],
                 val_stats["loss_offset"],
+                val_stats["loss_vote_consistency"],
+                val_stats["loss_separation"],
+                val_stats["loss_repulsion"],
+                val_stats["loss_conflict"],
+                val_stats["loss_affinity"],
+                val_stats["loss_overlap_excl"],
                 lr_now,
             ],
         )
+
+        is_new_best = val_stats["loss"] < best_val
+        if is_new_best:
+            best_val = val_stats["loss"]
 
         latest_ckpt = {
             "epoch": epoch,
@@ -910,10 +1579,8 @@ def main():
         }
         save_checkpoint(ckpt_dir / "latest.pth", latest_ckpt)
 
-        if val_stats["loss"] < best_val:
-            best_val = val_stats["loss"]
+        if is_new_best:
             best_ckpt = dict(latest_ckpt)
-            best_ckpt["best_val"] = best_val
             save_checkpoint(ckpt_dir / "best.pth", best_ckpt)
             print(f"[INFO] New best checkpoint saved. best_val={best_val:.6f}")
 

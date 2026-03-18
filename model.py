@@ -147,9 +147,9 @@ class QueryMaskHead(nn.Module):
 
 
 class AuxiliaryGeometryHead(nn.Module):
-    """Predict center heatmap and offset field from shared mask feature."""
+    """Predict geometry and topology cues from shared mask feature."""
 
-    def __init__(self, in_channels: int = 256):
+    def __init__(self, in_channels: int = 256, affinity_dim: int = 16):
         super().__init__()
         self.center_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
@@ -163,11 +163,38 @@ class AuxiliaryGeometryHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 2, kernel_size=1),
         )
+        self.separation_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+        )
+        self.conflict_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, kernel_size=1),
+        )
+        self.affinity_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, int(affinity_dim), kernel_size=1),
+        )
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         center_logits = self.center_head(x)  # [B, 1, H, W]
         offset = self.offset_head(x)  # [B, 2, H, W]
-        return {"pred_center": center_logits, "pred_offset": offset}
+        separation_logits = self.separation_head(x)  # [B, 1, H, W]
+        conflict_logits = self.conflict_head(x)  # [B, 1, H, W]
+        affinity_embed = self.affinity_head(x)  # [B, D, H, W]
+        return {
+            "pred_center": center_logits,
+            "pred_offset": offset,
+            "pred_separation": separation_logits,
+            "pred_conflict": conflict_logits,
+            "pred_affinity": affinity_embed,
+        }
 
 
 class LeafInstanceSegModel(nn.Module):
@@ -181,6 +208,7 @@ class LeafInstanceSegModel(nn.Module):
         input_size: int = 512,
         upsample_masks_to_input: bool = True,
         enable_aux_heads: bool = False,
+        aux_affinity_dim: int = 16,
     ):
         super().__init__()
         self.backbone = SwinBackbone(pretrained=pretrained, input_size=input_size)
@@ -193,7 +221,11 @@ class LeafInstanceSegModel(nn.Module):
         )
         self.upsample_masks_to_input = upsample_masks_to_input
         self.enable_aux_heads = bool(enable_aux_heads)
-        self.aux_head = AuxiliaryGeometryHead(in_channels=hidden_dim) if self.enable_aux_heads else None
+        self.aux_head = (
+            AuxiliaryGeometryHead(in_channels=hidden_dim, affinity_dim=int(aux_affinity_dim))
+            if self.enable_aux_heads
+            else None
+        )
 
     def forward(self, image: torch.Tensor) -> Dict[str, torch.Tensor]:
         feats = self.backbone(image)
@@ -210,6 +242,9 @@ class LeafInstanceSegModel(nn.Module):
             aux_out = self.aux_head(neck_out["mask_feature"])
             out_dict["pred_center"] = aux_out["pred_center"]
             out_dict["pred_offset"] = aux_out["pred_offset"]
+            out_dict["pred_separation"] = aux_out["pred_separation"]
+            out_dict["pred_conflict"] = aux_out["pred_conflict"]
+            out_dict["pred_affinity"] = aux_out["pred_affinity"]
 
         if self.upsample_masks_to_input:
             out_dict["pred_masks"] = F.interpolate(
@@ -228,6 +263,27 @@ class LeafInstanceSegModel(nn.Module):
             if "pred_offset" in out_dict:
                 out_dict["pred_offset"] = F.interpolate(
                     out_dict["pred_offset"],
+                    size=image.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            if "pred_separation" in out_dict:
+                out_dict["pred_separation"] = F.interpolate(
+                    out_dict["pred_separation"],
+                    size=image.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            if "pred_conflict" in out_dict:
+                out_dict["pred_conflict"] = F.interpolate(
+                    out_dict["pred_conflict"],
+                    size=image.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            if "pred_affinity" in out_dict:
+                out_dict["pred_affinity"] = F.interpolate(
+                    out_dict["pred_affinity"],
                     size=image.shape[-2:],
                     mode="bilinear",
                     align_corners=False,
@@ -258,3 +314,9 @@ if __name__ == "__main__":
         print("pred_center.shape:", out["pred_center"].shape)
     if "pred_offset" in out:
         print("pred_offset.shape:", out["pred_offset"].shape)
+    if "pred_separation" in out:
+        print("pred_separation.shape:", out["pred_separation"].shape)
+    if "pred_conflict" in out:
+        print("pred_conflict.shape:", out["pred_conflict"].shape)
+    if "pred_affinity" in out:
+        print("pred_affinity.shape:", out["pred_affinity"].shape)
