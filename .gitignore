@@ -35,3 +35,6 @@ pretrain_riceseg/outputs/
 Thumbs.db
 .vscode/
 .idea/
+.repo_tag_tmp*/
+.repo_publish_tmp*/
+.repo_fix_tmp*/
