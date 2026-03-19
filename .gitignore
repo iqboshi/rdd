@@ -1,0 +1,33 @@
+# Data / artifacts
+data/
+outputs/
+visual/
+pretrain_riceseg/outputs/
+
+# Local env / temp
+rdd-dev/
+.tmp/
+__pycache__/
+pretrain_riceseg/__pycache__/
+
+# Python caches
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Large model/checkpoint binaries
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.tar
+*.zip
+*.7z
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
