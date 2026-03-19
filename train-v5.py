@@ -45,14 +45,14 @@ def parse_args():
         default=["data/patches_size512", "data/patches_size768", "data/patches_size1024"],
         help="One or more patch roots.",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--persistent_workers", action="store_true", default=True)
     parser.add_argument("--no-persistent_workers", dest="persistent_workers", action="store_false")
-    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--input_size", type=int, default=512)
     parser.add_argument("--num_queries", type=int, default=50)
     parser.add_argument("--save_dir", type=str, default="outputs")
@@ -85,7 +85,7 @@ def parse_args():
     # Centralized loss/matcher args are defined in losses_v5.py.
     add_loss_args(parser)
 
-    parser.add_argument("--vis_every", type=int, default=1, help="Save train/val visualization every N epochs.")
+    parser.add_argument("--vis_every", type=int, default=5, help="Save train/val visualization every N epochs.")
     parser.add_argument("--max_train_steps", type=int, default=0, help="0 means no limit.")
     parser.add_argument("--max_val_steps", type=int, default=0, help="0 means no limit.")
     parser.add_argument("--num_workers_pin_memory", action="store_true", default=True)
@@ -107,7 +107,7 @@ def parse_args():
     parser.add_argument(
         "--tqdm_postfix_interval",
         type=int,
-        default=20,
+        default=50,
         help="Update tqdm postfix every N steps to reduce GPU-CPU sync overhead.",
     )
     parser.add_argument(
@@ -145,6 +145,17 @@ def configure_cuda_runtime(device: torch.device, args) -> None:
     torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
     torch.backends.cuda.matmul.allow_tf32 = bool(args.allow_tf32)
     torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+
+def dataloader_worker_init_fn(worker_id: int) -> None:
+    # Keep OpenCV single-threaded per worker to avoid oversubscription on high-core CPUs.
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+    seed = torch.initial_seed() % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def leaf_collate_fn(batch: List[Dict]):
@@ -796,6 +807,7 @@ def main():
         pin_memory=bool(args.num_workers_pin_memory),
         persistent_workers=bool(args.persistent_workers and args.num_workers > 0),
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        worker_init_fn=dataloader_worker_init_fn if args.num_workers > 0 else None,
         drop_last=False,
         collate_fn=leaf_collate_fn,
     )
@@ -807,6 +819,7 @@ def main():
         pin_memory=bool(args.num_workers_pin_memory),
         persistent_workers=bool(args.persistent_workers and args.num_workers > 0),
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        worker_init_fn=dataloader_worker_init_fn if args.num_workers > 0 else None,
         drop_last=False,
         collate_fn=leaf_collate_fn,
     )
