@@ -77,6 +77,11 @@
       - 盲评包: `outputs/review_pack_blind_ab_a7s2_vs_a4r3_20260318`
       - 解码结果: A7-s2 `14/24`（58.33%）vs A4-r3 `10/24`（41.67%）
       - 桶级差异: boundary/dense 明显偏向 A7-s2；highlight 与 scale_anchor_1024 偏向 A4-r3
+  - 训练工程化（2026-03-18）:
+    - 已将 `train-v5.py` 中 loss/匹配器/aux目标构建逻辑拆分到 `losses_v5.py`
+    - `train-v5.py` 改为通过 `from losses_v5 import ...` 统一调用
+    - loss 相关 CLI 参数注册集中到 `add_loss_args(parser)`，便于统一维护默认值并减少每次训练命令输入
+    - `losses_v5.py` 默认 loss 参数已对齐 A7 基线常用配置（含 `enable_aux_heads=True`）
 
 ## 5. 关键命令模板
 - 训练（cuda + 进度条）:
@@ -111,6 +116,7 @@
   - 当前最佳为 s2（`MAE=10.0417`, `rel_improve=2.03%`, `dense_abs_improve=+1.8333`），但 merge 相关指标仍负向。
   - 已完成 A7-s2 vs A4-r3 盲评解码，A7-s2 胜出（`14/24`）。
   - 已正式切换固定基线到 A7-s2（保留 A4-r3 作为历史对照锚点）。
+  - 训练脚本已完成 loss 模块化，后续 loss 调整优先在 `losses_v5.py` 进行。
 - 相关文件:
   - 本地: `outputs/review_pack_blind_ab_a6s4_vs_a4r3_20260318`
   - Obsidian: `C:\Users\23581\Documents\some_scientific_ideas\rdd\review_pack_blind_ab_a6s4_vs_a4r3_20260318`
@@ -122,6 +128,7 @@
 
 ## 8. 下一步 TODO（执行优先级）
 1. 冻结新基线：`A7-s2` 评测协议与 checkpoint（作为后续所有候选统一对照）。
-2. 在新基线上做定向优化：重点补齐 highlight/scale_anchor_1024 的回退问题。
-3. 维持门控 + 盲评双重机制，避免仅靠单一指标做错误采纳。
-4. 仅当出现新一轮“指标显著提升 + 门控通过”时，触发下一次人工盲评。
+2. 在 `losses_v5.py` 统一维护 loss 默认参数；训练命令优先只传必要增量参数。
+3. 在新基线上做定向优化：重点补齐 highlight/scale_anchor_1024 的回退问题。
+4. 维持门控 + 盲评双重机制，避免仅靠单一指标做错误采纳。
+5. 仅当出现新一轮“指标显著提升 + 门控通过”时，触发下一次人工盲评。
